@@ -167,8 +167,44 @@ char *object_write(ObjectType type, const uint8_t *data, size_t size) {
 //
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
-int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+uint8_t *object_read(const char *hex, ObjectType *type_out, size_t *size_out) {
+    // Step 1: Build path from hex
+    char path[512];
+    snprintf(path, sizeof(path), ".pes/objects/%.2s/%s", hex, hex + 2);
+
+    // Step 2: Read entire file
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    size_t full_size = ftell(f);
+    rewind(f);
+    uint8_t *full = malloc(full_size);
+    fread(full, 1, full_size, f);
+    fclose(f);
+
+    // Step 3: Verify integrity — rehash and compare to filename
+    uint8_t hash[32]; char computed[65];
+    SHA256(full, full_size, hash);
+    for (int i = 0; i < 32; i++) sprintf(computed + i*2, "%02x", hash[i]);
+    computed[64] = '\0';
+    if (strcmp(computed, hex) != 0) { free(full); return NULL; }
+
+    // Step 4: Parse header "blob 123\0..."
+    char *null_pos = memchr(full, '\0', full_size);
+    if (!null_pos) { free(full); return NULL; }
+
+    // Extract type
+    if (strncmp((char*)full, "blob", 4) == 0)        *type_out = OBJ_BLOB;
+    else if (strncmp((char*)full, "tree", 4) == 0)   *type_out = OBJ_TREE;
+    else                                              *type_out = OBJ_COMMIT;
+
+    // Extract size from header
+    size_t data_offset = null_pos - (char*)full + 1;
+    *size_out = full_size - data_offset;
+
+    // Step 5: Return just the data portion
+    uint8_t *data = malloc(*size_out);
+    memcpy(data, full + data_offset, *size_out);
+    free(full);
+    return data;
 }
