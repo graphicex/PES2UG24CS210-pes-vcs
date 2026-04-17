@@ -16,7 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <openssl/evp.h>
-
+#include <openssl/sha.h>
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 void hash_to_hex(const ObjectID *id, char *hex_out) {
@@ -93,59 +93,68 @@ int object_exists(const ObjectID *id) {
 
 //
 // Returns 0 on success, -1 on error.
-char *object_write(ObjectType type, const uint8_t *data, size_t size) {
-    // Step 1: Build the header string: "blob 16\0" or "tree 16\0" etc.
+// Returns 0 on success, -1 on error.
+int object_write(ObjectType type, const uint8_t *data, size_t size, ObjectID *id_out) {
     const char *type_str;
     if (type == OBJ_BLOB)       type_str = "blob";
     else if (type == OBJ_TREE)  type_str = "tree";
     else                        type_str = "commit";
 
+    // Step 1: Build the header string
     char header[64];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, size);
-    // header_len does NOT include the null byte, but we want it in the store
     size_t full_size = header_len + 1 + size; // +1 for '\0'
 
     // Step 2: Allocate full object buffer
     uint8_t *full = malloc(full_size);
+    if (!full) return -1;
     memcpy(full, header, header_len);
     full[header_len] = '\0';
     memcpy(full + header_len + 1, data, size);
 
-    // Step 3: SHA-256 hash the full buffer
-    uint8_t hash[32];
-    SHA256(full, full_size, hash);
+    // Step 3: Compute hash using the PROVIDED function (Solves your SHA256 error!)
+    compute_hash(full, full_size, id_out);
 
-    // Step 4: Convert hash to hex string (64 chars)
-    char *hex = malloc(65);
-    for (int i = 0; i < 32; i++)
-        sprintf(hex + i*2, "%02x", hash[i]);
-    hex[64] = '\0';
+    // Step 4: Deduplication - if it exists, we are done!
+    if (object_exists(id_out)) {
+        free(full);
+        return 0; // Success
+    }
 
-    // Step 5: Build path .pes/objects/XX/YYYY...
-    char dir[512], path[512];
-    snprintf(dir, sizeof(dir), ".pes/objects/%.2s", hex);
-    snprintf(path, sizeof(path), "%s/%s", dir, hex + 2);
+    // Step 5: Get paths using provided helper functions
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+    
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+    
+    char dir[512];
+    // NOTE: Replace "OBJECTS_DIR" with whatever macro/string your pes.h uses, e.g., ".pes/objects"
+    snprintf(dir, sizeof(dir), ".pes/objects/%.2s", hex); 
 
-    // Step 6: If file already exists, deduplication! Skip writing.
-    if (access(path, F_OK) == 0) { free(full); return hex; }
-
-    // Step 7: Create the shard directory
+    // Step 6: Create the shard directory
     mkdir(dir, 0755);
 
-    // Step 8: Atomic write — write to temp file, then rename
-    char tmp[512];
+    // Step 7: Atomic write to temp file, then rename
+    char tmp[520]; 
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb");
-    fwrite(full, 1, full_size, f);
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
+    
+    // Using open/write/fsync as hinted in your comments
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+    
+    write(fd, full, full_size);
+    fsync(fd);
+    close(fd);
+    
     rename(tmp, path);
 
     free(full);
-    return hex; // caller must free
-}
-// Read an object from the store.
+    return 0; // Success! rc == 0 will now pass.
+}// Read an object from the store.
 //
 // Steps:
 //   1. Build the file path from the hash using object_path()
@@ -167,44 +176,60 @@ char *object_write(ObjectType type, const uint8_t *data, size_t size) {
 //
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
-uint8_t *object_read(const char *hex, ObjectType *type_out, size_t *size_out) {
-    // Step 1: Build path from hex
+// Returns 0 on success, -1 on error.
+int object_read(const ObjectID *id, ObjectType *type_out, uint8_t **data_out, size_t *size_out) {
+    // Step 1: Build path from ObjectID
     char path[512];
-    snprintf(path, sizeof(path), ".pes/objects/%.2s/%s", hex, hex + 2);
+    object_path(id, path, sizeof(path));
 
     // Step 2: Read entire file
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) return -1;
+    
     fseek(f, 0, SEEK_END);
     size_t full_size = ftell(f);
     rewind(f);
+    
     uint8_t *full = malloc(full_size);
-    fread(full, 1, full_size, f);
+    if (!full) {
+        fclose(f);
+        return -1;
+    }
+    
+    if (fread(full, 1, full_size, f) != full_size) {
+        free(full);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
 
-    // Step 3: Verify integrity — rehash and compare to filename
-    uint8_t hash[32]; char computed[65];
-    SHA256(full, full_size, hash);
-    for (int i = 0; i < 32; i++) sprintf(computed + i*2, "%02x", hash[i]);
-    computed[64] = '\0';
-    if (strcmp(computed, hex) != 0) { free(full); return NULL; }
+    // Step 3: Verify integrity — use provided compute_hash!
+    ObjectID computed_id;
+    compute_hash(full, full_size, &computed_id);
+    
+    // Compare the raw hash bytes
+    if (memcmp(computed_id.hash, id->hash, HASH_SIZE) != 0) { 
+        free(full); 
+        return -1; // Corrupted file
+    }
 
     // Step 4: Parse header "blob 123\0..."
     char *null_pos = memchr(full, '\0', full_size);
-    if (!null_pos) { free(full); return NULL; }
+    if (!null_pos) { free(full); return -1; }
 
     // Extract type
     if (strncmp((char*)full, "blob", 4) == 0)        *type_out = OBJ_BLOB;
     else if (strncmp((char*)full, "tree", 4) == 0)   *type_out = OBJ_TREE;
-    else                                              *type_out = OBJ_COMMIT;
+    else                                             *type_out = OBJ_COMMIT;
 
     // Extract size from header
     size_t data_offset = null_pos - (char*)full + 1;
     *size_out = full_size - data_offset;
 
-    // Step 5: Return just the data portion
-    uint8_t *data = malloc(*size_out);
-    memcpy(data, full + data_offset, *size_out);
+    // Step 5: Allocate and set the output data pointer
+    *data_out = malloc(*size_out);
+    memcpy(*data_out, full + data_offset, *size_out);
+    
     free(full);
-    return data;
+    return 0; // Success
 }
